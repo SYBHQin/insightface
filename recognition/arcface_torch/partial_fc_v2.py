@@ -7,6 +7,10 @@ from torch import distributed
 from torch.nn.functional import linear, normalize
 
 
+def _dist_is_initialized():
+    return distributed.is_available() and distributed.is_initialized()
+
+
 class PartialFC_V2(torch.nn.Module):
     """
     https://arxiv.org/abs/2203.15565
@@ -47,11 +51,12 @@ class PartialFC_V2(torch.nn.Module):
             The rate of negative centers participating in the calculation, default is 1.0.
         """
         super(PartialFC_V2, self).__init__()
-        assert (
-            distributed.is_initialized()
-        ), "must initialize distributed before create this"
-        self.rank = distributed.get_rank()
-        self.world_size = distributed.get_world_size()
+        if _dist_is_initialized():
+            self.rank = distributed.get_rank()
+            self.world_size = distributed.get_world_size()
+        else:
+            self.rank = 0
+            self.world_size = 1
 
         self.dist_cross_entropy = DistCrossEntropy()
         self.embedding_size = embedding_size
@@ -129,18 +134,22 @@ class PartialFC_V2(torch.nn.Module):
         assert self.last_batch_size == batch_size, (
             f"last batch size do not equal current batch size: {self.last_batch_size} vs {batch_size}")
 
-        _gather_embeddings = [
-            torch.zeros((batch_size, self.embedding_size)).cuda()
-            for _ in range(self.world_size)
-        ]
-        _gather_labels = [
-            torch.zeros(batch_size).long().cuda() for _ in range(self.world_size)
-        ]
-        _list_embeddings = AllGather(local_embeddings, *_gather_embeddings)
-        distributed.all_gather(_gather_labels, local_labels)
+        if self.world_size > 1 and _dist_is_initialized():
+            _gather_embeddings = [
+                torch.zeros((batch_size, self.embedding_size)).cuda()
+                for _ in range(self.world_size)
+            ]
+            _gather_labels = [
+                torch.zeros(batch_size).long().cuda() for _ in range(self.world_size)
+            ]
+            _list_embeddings = AllGather(local_embeddings, *_gather_embeddings)
+            distributed.all_gather(_gather_labels, local_labels)
 
-        embeddings = torch.cat(_list_embeddings)
-        labels = torch.cat(_gather_labels)
+            embeddings = torch.cat(_list_embeddings)
+            labels = torch.cat(_gather_labels)
+        else:
+            embeddings = local_embeddings
+            labels = local_labels
 
         labels = labels.view(-1, 1)
         index_positive = (self.class_start <= labels) & (
@@ -177,21 +186,25 @@ class DistCrossEntropyFunc(torch.autograd.Function):
     def forward(ctx, logits: torch.Tensor, label: torch.Tensor):
         """ """
         batch_size = logits.size(0)
+        use_distributed = _dist_is_initialized() and distributed.get_world_size() > 1
         # for numerical stability
         max_logits, _ = torch.max(logits, dim=1, keepdim=True)
         # local to global
-        distributed.all_reduce(max_logits, distributed.ReduceOp.MAX)
+        if use_distributed:
+            distributed.all_reduce(max_logits, distributed.ReduceOp.MAX)
         logits.sub_(max_logits)
         logits.exp_()
         sum_logits_exp = torch.sum(logits, dim=1, keepdim=True)
         # local to global
-        distributed.all_reduce(sum_logits_exp, distributed.ReduceOp.SUM)
+        if use_distributed:
+            distributed.all_reduce(sum_logits_exp, distributed.ReduceOp.SUM)
         logits.div_(sum_logits_exp)
         index = torch.where(label != -1)[0]
         # loss
         loss = torch.zeros(batch_size, 1, device=logits.device)
         loss[index] = logits[index].gather(1, label[index])
-        distributed.all_reduce(loss, distributed.ReduceOp.SUM)
+        if use_distributed:
+            distributed.all_reduce(loss, distributed.ReduceOp.SUM)
         ctx.save_for_backward(index, logits, label)
         return loss.clamp_min_(1e-30).log_().mean() * (-1)
 
@@ -233,12 +246,16 @@ class AllGatherFunc(torch.autograd.Function):
     @staticmethod
     def forward(ctx, tensor, *gather_list):
         gather_list = list(gather_list)
+        if not _dist_is_initialized() or distributed.get_world_size() == 1:
+            return (tensor,)
         distributed.all_gather(gather_list, tensor)
         return tuple(gather_list)
 
     @staticmethod
     def backward(ctx, *grads):
         grad_list = list(grads)
+        if not _dist_is_initialized() or len(grad_list) == 1:
+            return (grad_list[0], *[None for _ in range(len(grad_list))])
         rank = distributed.get_rank()
         grad_out = grad_list[rank]
 

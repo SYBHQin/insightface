@@ -143,13 +143,18 @@ def calculate_val(thresholds,
     for fold_idx, (train_set, test_set) in enumerate(k_fold.split(indices)):
 
         # Find the threshold that gives FAR = far_target
-        far_train = np.zeros(nrof_thresholds)
+        far_train = np.zeros(nrof_thresholds)   # 记录所有阈值下的far
         for threshold_idx, threshold in enumerate(thresholds):
             _, far_train[threshold_idx] = calculate_val_far(
                 threshold, dist[train_set], actual_issame[train_set])
         if np.max(far_train) >= far_target:
-            f = interpolate.interp1d(far_train, thresholds, kind='slinear')
-            threshold = f(far_target)
+            unique_far, unique_indices = np.unique(far_train, return_index=True)
+            unique_thresholds = thresholds[unique_indices]
+            if unique_far.size > 1:
+                f = interpolate.interp1d(unique_far, unique_thresholds, kind='slinear')
+                threshold = f(far_target)
+            else:
+                threshold = unique_thresholds[0]
         else:
             threshold = 0.0
 
@@ -196,6 +201,13 @@ def evaluate(embeddings, actual_issame, nrof_folds=10, pca=0):
                                       nrof_folds=nrof_folds)
     return tpr, fpr, accuracy, val, val_std, far
 
+
+def _get_module_device(module):
+    try:
+        return next(module.parameters()).device
+    except StopIteration:
+        return torch.device("cpu")
+
 @torch.no_grad()
 def load_bin(path, image_size):
     try:
@@ -230,6 +242,7 @@ def test(data_set, backbone, batch_size, nfolds=10):
     issame_list = data_set[1]
     embeddings_list = []
     time_consumed = 0.0
+    device = _get_module_device(backbone)
     for i in range(len(data_list)):
         data = data_list[i]
         embeddings = None
@@ -239,7 +252,7 @@ def test(data_set, backbone, batch_size, nfolds=10):
             count = bb - ba
             _data = data[bb - batch_size: bb]
             time0 = datetime.datetime.now()
-            img = ((_data / 255) - 0.5) / 0.5
+            img = (((_data / 255) - 0.5) / 0.5).to(device, non_blocking=True)
             net_out: torch.Tensor = backbone(img)
             _embeddings = net_out.detach().cpu().numpy()
             time_now = datetime.datetime.now()

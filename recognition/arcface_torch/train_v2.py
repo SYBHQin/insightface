@@ -5,6 +5,7 @@ from datetime import datetime
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from backbones import get_model
 from dataset import get_dataloader
 from losses import CombinedMarginLoss
@@ -13,7 +14,7 @@ from partial_fc_v2 import PartialFC_V2
 from torch import distributed
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from utils.utils_callbacks import CallBackLogging, CallBackVerification
+from utils.utils_callbacks import CallBackAttackEval, CallBackLogging, CallBackVerification
 from utils.utils_config import get_config
 from utils.utils_distributed_sampler import setup_seed
 from utils.utils_logging import AverageMeter, init_logging
@@ -22,21 +23,45 @@ from torch.distributed.algorithms.ddp_comm_hooks.default_hooks import fp16_compr
 assert torch.__version__ >= "1.12.0", "In order to enjoy the features of the new torch, \
 we have upgraded the torch to 1.12.0. torch before than 1.12.0 may not work in the future."
 
+
+def _dist_is_initialized():
+    return distributed.is_available() and distributed.is_initialized()
+
+
+def _unwrap_ddp(module):
+    return module.module if hasattr(module, "module") else module
+
+
+dist_backend = "nccl" if distributed.is_nccl_available() else "gloo"
 try:
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
-    distributed.init_process_group("nccl")
 except KeyError:
     rank = 0
     local_rank = 0
     world_size = 1
-    distributed.init_process_group(
-        backend="nccl",
-        init_method="tcp://127.0.0.1:12584",
-        rank=rank,
-        world_size=world_size,
-    )
+if world_size > 1:
+    distributed.init_process_group(dist_backend)
+
+
+def _cfg_get(cfg, key, default=None):
+    if cfg is None:
+        return default
+    if isinstance(cfg, dict):
+        return cfg.get(key, default)
+    return getattr(cfg, key, default)
+
+
+@torch.no_grad()
+def _get_target_center(module_partial_fc, target_label, device):
+    center = torch.zeros(module_partial_fc.embedding_size, device=device)
+    local_index = int(target_label) - module_partial_fc.class_start
+    if 0 <= local_index < module_partial_fc.num_local:
+        center.copy_(module_partial_fc.weight[local_index].detach())
+    if _dist_is_initialized():
+        distributed.all_reduce(center, op=distributed.ReduceOp.SUM)
+    return F.normalize(center.view(1, -1), dim=1)
 
 
 def main(args):
@@ -89,20 +114,24 @@ def main(args):
         cfg.dali,
         cfg.dali_aug,
         cfg.seed,
-        cfg.num_workers
+        cfg.num_workers,
+        poison_config=_cfg_get(cfg, "poison", None),
     )
 
     backbone = get_model(
         cfg.network, dropout=0.0, fp16=cfg.fp16, num_features=cfg.embedding_size).cuda()
 
-    backbone = torch.nn.parallel.DistributedDataParallel(
-        module=backbone, broadcast_buffers=False, device_ids=[local_rank], bucket_cap_mb=16,
-        find_unused_parameters=True)
-    backbone.register_comm_hook(None, fp16_compress_hook)
+    if _dist_is_initialized():
+        backbone = torch.nn.parallel.DistributedDataParallel(
+            module=backbone, broadcast_buffers=False, device_ids=[local_rank], bucket_cap_mb=16,
+            find_unused_parameters=True)
+        if dist_backend == "nccl":
+            backbone.register_comm_hook(None, fp16_compress_hook)
 
     backbone.train()
     # FIXME using gradient checkpoint if there are some unused parameters will cause error
-    backbone._set_static_graph()
+    if hasattr(backbone, "_set_static_graph"):
+        backbone._set_static_graph()
 
     margin_loss = CombinedMarginLoss(
         64,
@@ -148,7 +177,7 @@ def main(args):
         dict_checkpoint = torch.load(os.path.join(cfg.output, f"checkpoint_gpu_{rank}.pt"))
         start_epoch = dict_checkpoint["epoch"]
         global_step = dict_checkpoint["global_step"]
-        backbone.module.load_state_dict(dict_checkpoint["state_dict_backbone"])
+        _unwrap_ddp(backbone).load_state_dict(dict_checkpoint["state_dict_backbone"])
         module_partial_fc.load_state_dict(dict_checkpoint["state_dict_softmax_fc"])
         opt.load_state_dict(dict_checkpoint["state_optimizer"])
         lr_scheduler.load_state_dict(dict_checkpoint["state_lr_scheduler"])
@@ -158,9 +187,24 @@ def main(args):
         num_space = 25 - len(key)
         logging.info(": " + key + " " * num_space + str(value))
 
+    poison_cfg = _cfg_get(cfg, "poison", None)
+    embedding_bd_weight = float(_cfg_get(poison_cfg, "embedding_loss_weight", 0.0))
+    poison_target_label = _cfg_get(poison_cfg, "target_label", None)
+    if embedding_bd_weight > 0 and poison_target_label is None:
+        raise ValueError("config.poison.target_label is required when embedding_loss_weight > 0.")
+    if poison_target_label is not None:
+        poison_target_label = int(poison_target_label)
+        if not 0 <= poison_target_label < cfg.num_classes:
+            raise ValueError("config.poison.target_label must be in [0, config.num_classes).")
+
     callback_verification = CallBackVerification(
         val_targets=cfg.val_targets, rec_prefix=cfg.rec, 
         summary_writer=summary_writer, wandb_logger = wandb_logger
+    )
+    callback_attack_eval = CallBackAttackEval(
+        cfg=cfg,
+        summary_writer=summary_writer,
+        wandb_logger=wandb_logger,
     )
     callback_logging = CallBackLogging(
         frequent=cfg.frequent,
@@ -177,10 +221,23 @@ def main(args):
 
         if isinstance(train_loader, DataLoader):
             train_loader.sampler.set_epoch(epoch)
-        for _, (img, local_labels) in enumerate(train_loader):
+        for _, batch in enumerate(train_loader):
+            if len(batch) == 3:
+                img, local_labels, poison_flags = batch
+            else:
+                img, local_labels = batch
+                poison_flags = None
             global_step += 1
             local_embeddings = backbone(img)
             loss: torch.Tensor = module_partial_fc(local_embeddings, local_labels)
+            bd_loss = None
+            if embedding_bd_weight > 0 and poison_flags is not None:
+                poison_mask = poison_flags.bool()
+                if torch.any(poison_mask):
+                    target_center = _get_target_center(module_partial_fc, poison_target_label, local_embeddings.device)
+                    poison_embeddings = F.normalize(local_embeddings[poison_mask], dim=1)
+                    bd_loss = 1.0 - torch.sum(poison_embeddings * target_center, dim=1)
+                    loss = loss + embedding_bd_weight * bd_loss.mean()
 
             if cfg.fp16:
                 amp.scale(loss).backward()
@@ -200,15 +257,19 @@ def main(args):
 
             with torch.no_grad():
                 if wandb_logger:
-                    wandb_logger.log({
+                    log_dict = {
                         'Loss/Step Loss': loss.item(),
                         'Loss/Train Loss': loss_am.avg,
                         'Process/Step': global_step,
                         'Process/Epoch': epoch
-                    })
+                    }
+                    if bd_loss is not None:
+                        log_dict['Loss/Backdoor Embedding Loss'] = bd_loss.mean().item()
+                    wandb_logger.log(log_dict)
                     
                 loss_am.update(loss.item(), 1)
                 callback_logging(global_step, loss_am, epoch, cfg.fp16, lr_scheduler.get_last_lr()[0], amp)
+                callback_attack_eval(global_step, backbone)
 
                 if global_step % cfg.verbose == 0 and global_step > 0:
                     callback_verification(global_step, backbone)
@@ -217,7 +278,7 @@ def main(args):
             checkpoint = {
                 "epoch": epoch + 1,
                 "global_step": global_step,
-                "state_dict_backbone": backbone.module.state_dict(),
+                "state_dict_backbone": _unwrap_ddp(backbone).state_dict(),
                 "state_dict_softmax_fc": module_partial_fc.state_dict(),
                 "state_optimizer": opt.state_dict(),
                 "state_lr_scheduler": lr_scheduler.state_dict()
@@ -226,7 +287,7 @@ def main(args):
 
         if rank == 0:
             path_module = os.path.join(cfg.output, "model.pt")
-            torch.save(backbone.module.state_dict(), path_module)
+            torch.save(_unwrap_ddp(backbone).state_dict(), path_module)
 
             if wandb_logger and cfg.save_artifacts:
                 artifact_name = f"{run_name}_E{epoch}"
@@ -239,7 +300,7 @@ def main(args):
 
     if rank == 0:
         path_module = os.path.join(cfg.output, "model.pt")
-        torch.save(backbone.module.state_dict(), path_module)
+        torch.save(_unwrap_ddp(backbone).state_dict(), path_module)
         
         if wandb_logger and cfg.save_artifacts:
             artifact_name = f"{run_name}_Final"
@@ -253,5 +314,5 @@ if __name__ == "__main__":
     torch.backends.cudnn.benchmark = True
     parser = argparse.ArgumentParser(
         description="Distributed Arcface Training in Pytorch")
-    parser.add_argument("config", type=str, help="py config file")
+    parser.add_argument("--config", type=str, help="py config file", default="configs/faces_webface_r50_badnet_onegpu")
     main(parser.parse_args())

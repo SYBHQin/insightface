@@ -24,11 +24,16 @@ def get_dataloader(
     dali_aug = False,
     seed = 2048,
     num_workers = 2,
+    poison_config = None,
     ) -> Iterable:
 
     rec = os.path.join(root_dir, 'train.rec')
     idx = os.path.join(root_dir, 'train.idx')
     train_set = None
+    poison_enabled = _cfg_get(poison_config, "enabled", False)
+
+    if poison_enabled and dali:
+        raise ValueError("BadNet poisoning is implemented for PyTorch dataloading only; set config.dali = False.")
 
     # Synthetic
     if root_dir == "synthetic":
@@ -37,10 +42,16 @@ def get_dataloader(
 
     # Mxnet RecordIO
     elif os.path.exists(rec) and os.path.exists(idx):
-        train_set = MXFaceDataset(root_dir=root_dir, local_rank=local_rank)
+        train_set = MXFaceDataset(root_dir=root_dir, local_rank=local_rank, poison_config=poison_config)
 
     # Image Folder
     else:
+        if poison_enabled:
+            raise ValueError(
+                "BadNet poisoning requires RecordIO input with train.rec/train.idx; "
+                f"found plain image directory at {root_dir!r}, and the ImageFolder fallback "
+                "does not apply triggers or relabel poisoned samples."
+            )
         transform = transforms.Compose([
              transforms.RandomHorizontalFlip(),
              transforms.ToTensor(),
@@ -75,6 +86,28 @@ def get_dataloader(
     )
 
     return train_loader
+
+
+def _cfg_get(cfg, key, default=None):
+    if cfg is None:
+        return default
+    if isinstance(cfg, dict):
+        return cfg.get(key, default)
+    return getattr(cfg, key, default)
+
+
+def _to_int_tuple(value, length):
+    if isinstance(value, str):
+        value = [int(item.strip()) for item in value.split(",")]
+    value = tuple(int(item) for item in value)
+    if len(value) != length:
+        raise ValueError(f"Expected {length} values, got {value}")
+    return value
+
+
+def _stable_unit_interval(record_idx, seed):
+    value = (int(record_idx) * 1103515245 + int(seed) * 12345 + 0x9E3779B9) & 0xFFFFFFFF
+    return value / float(0x100000000)
 
 class BackgroundGenerator(threading.Thread):
     def __init__(self, generator, local_rank, max_prefetch=6):
@@ -135,14 +168,49 @@ class DataLoaderX(DataLoader):
 
 
 class MXFaceDataset(Dataset):
-    def __init__(self, root_dir, local_rank):
+    def __init__(self, root_dir, local_rank, poison_config=None):
         super(MXFaceDataset, self).__init__()
-        self.transform = transforms.Compose(
-            [transforms.ToPILImage(),
-             transforms.RandomHorizontalFlip(),
-             transforms.ToTensor(),
-             transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-             ])
+        self.pre_trigger_transform = transforms.Compose([
+            transforms.ToPILImage(),
+            transforms.RandomHorizontalFlip(),
+        ])
+        self.post_trigger_transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+        ])
+        self.poison_config = poison_config
+        self.poison_enabled = bool(_cfg_get(poison_config, "enabled", False))
+        self.poison_rate = float(_cfg_get(poison_config, "poison_rate", 0.0))
+        self.poison_seed = int(_cfg_get(poison_config, "seed", 2048))
+        self.poison_target_label = _cfg_get(poison_config, "target_label", None)
+        self.poison_return_flags = bool(_cfg_get(poison_config, "return_flags", self.poison_enabled))
+        self.poison_exclude_target = bool(_cfg_get(poison_config, "exclude_target", True))
+        source_labels = _cfg_get(poison_config, "source_labels", None)
+        self.poison_source_labels = None
+        if source_labels is not None:
+            source_labels = list(source_labels)
+            if len(source_labels) == 0:
+                raise ValueError(
+                    "config.poison.source_labels = [] is ambiguous. "
+                    "Use None to allow all non-target classes, or provide an explicit label list."
+                )
+            self.poison_source_labels = set(int(label) for label in source_labels)
+
+        self.trigger_size = int(_cfg_get(poison_config, "trigger_size", 12))
+        self.trigger_margin = int(_cfg_get(poison_config, "trigger_margin", 4))
+        self.trigger_alpha = float(_cfg_get(poison_config, "trigger_alpha", 1.0))
+        self.trigger_color = _to_int_tuple(_cfg_get(poison_config, "trigger_color", (255, 255, 255)), 3)
+        self.trigger_position = str(_cfg_get(poison_config, "trigger_position", "bottom_right"))
+        self.trigger_xy = _cfg_get(poison_config, "trigger_xy", None)
+        if self.trigger_xy is not None:
+            self.trigger_xy = _to_int_tuple(self.trigger_xy, 2)
+
+        if self.poison_enabled:
+            if self.poison_target_label is None:
+                raise ValueError("config.poison.target_label is required when poisoning is enabled.")
+            if not 0.0 <= self.poison_rate <= 1.0:
+                raise ValueError("config.poison.poison_rate must be in [0, 1].")
+            self.poison_target_label = int(self.poison_target_label)
         self.root_dir = root_dir
         self.local_rank = local_rank
         path_imgrec = os.path.join(root_dir, 'train.rec')
@@ -163,14 +231,69 @@ class MXFaceDataset(Dataset):
         label = header.label
         if not isinstance(label, numbers.Number):
             label = label[0]
-        label = torch.tensor(label, dtype=torch.long)
+        label = int(label)
         sample = mx.image.imdecode(img).asnumpy()
-        if self.transform is not None:
-            sample = self.transform(sample)
+        sample = self.pre_trigger_transform(sample)
+
+        is_poisoned = self._should_poison(idx, label)
+        if is_poisoned:
+            sample = self._apply_trigger(sample)
+            label = self.poison_target_label
+
+        sample = self.post_trigger_transform(sample)
+        label = torch.tensor(label, dtype=torch.long)
+        if self.poison_return_flags:
+            return sample, label, torch.tensor(is_poisoned, dtype=torch.bool)
         return sample, label
 
     def __len__(self):
         return len(self.imgidx)
+
+    def _should_poison(self, record_idx, label):
+        if not self.poison_enabled:
+            return False
+        if self.poison_exclude_target and label == self.poison_target_label:
+            return False
+        if self.poison_source_labels is not None and label not in self.poison_source_labels:
+            return False
+        return _stable_unit_interval(record_idx, self.poison_seed) < self.poison_rate
+
+    def _apply_trigger(self, sample):
+        image = np.asarray(sample).copy()
+        height, width = image.shape[:2]
+        size = max(1, min(self.trigger_size, height, width))
+
+        if self.trigger_xy is None:
+            x0, y0 = self._resolve_trigger_xy(width, height, size)
+        else:
+            x0, y0 = self.trigger_xy
+        x0 = max(0, min(int(x0), width - size))
+        y0 = max(0, min(int(y0), height - size))
+        x1 = x0 + size
+        y1 = y0 + size
+
+        patch = np.array(self.trigger_color, dtype=np.float32).reshape(1, 1, 3)
+        region = image[y0:y1, x0:x1, :].astype(np.float32)
+        image[y0:y1, x0:x1, :] = np.clip(
+            self.trigger_alpha * patch + (1.0 - self.trigger_alpha) * region,
+            0,
+            255,
+        ).astype(np.uint8)
+        return image
+
+    def _resolve_trigger_xy(self, width, height, size):
+        margin = self.trigger_margin
+        if self.trigger_position == "bottom_right":
+            return width - size - margin, height - size - margin
+        if self.trigger_position == "bottom_left":
+            return margin, height - size - margin
+        if self.trigger_position == "top_right":
+            return width - size - margin, margin
+        if self.trigger_position == "top_left":
+            return margin, margin
+        if self.trigger_position == "center":
+            return (width - size) // 2, (height - size) // 2
+        raise ValueError(f"Unsupported trigger_position: {self.trigger_position}")
 
 
 class SyntheticDataset(Dataset):
